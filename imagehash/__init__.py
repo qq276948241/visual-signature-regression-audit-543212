@@ -30,10 +30,13 @@ Rotation by 26: 21 Hamming difference
 
 from __future__ import absolute_import, division, print_function
 
+import io
+import operator
 import sys
+import threading
 
 import numpy
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageOps
 
 try:
 	ANTIALIAS = Image.Resampling.LANCZOS
@@ -42,7 +45,6 @@ except AttributeError:
 	# https://pillow.readthedocs.io/en/stable/deprecations.html
 	ANTIALIAS = Image.ANTIALIAS
 
-__version__ = '4.3.2'
 
 """
 You may copy this file, if you keep the copyright information below:
@@ -78,6 +80,285 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 """
 
+__version__ = '4.3.2'
+
+#: Opaque colour used to flatten transparent pixels before hashing.
+#:
+#: Transparent pixels still carry RGB values in RGBA, PA, LA and palette
+#: images.  Letting Pillow drop the alpha channel would silently expose
+#: those hidden values, so ``to_visual_image`` composites every image over
+#: this fixed background instead.  White keeps fully opaque images
+#: bit-for-bit identical to their pre-contract hashes.
+DEFAULT_BACKGROUND = (255, 255, 255)
+
+#: Serialises frame extraction for multi-frame images.  ``Image.seek()``
+#: mutates the caller's image object, so two threads reading frames from the
+#: same GIF/APNG must not interleave.  This lock protects no pixel data of
+#: its own.
+_FRAME_LOCK = threading.RLock()
+
+_ALPHA_MODES = frozenset(('RGBA', 'LA', 'PA', 'RGBa', 'La'))
+
+
+class ImageHashError(ValueError):
+	"""Base class for invalid images or hashing parameters."""
+
+
+class ImageHashSizeError(ImageHashError, AssertionError):
+	"""Raised for invalid ``hash_size``/``image_scale``/``binbits`` values.
+
+	Also subclasses :class:`AssertionError` so that callers written against
+	the historical ``assert`` based validation keep working.
+	"""
+
+
+def _check_image(image):
+	"""Validate the public ``image`` argument and return it unchanged."""
+	if isinstance(image, Image.Image):
+		return image
+	# Duck-typed ``Image.Image`` look-alikes (e.g. mocks) are accepted as long
+	# as they expose the size/mode attributes the hash functions require.
+	if hasattr(image, 'mode') and hasattr(image, 'size'):
+		return image
+	raise TypeError('image must be a PIL.Image.Image, not {!r}'.format(type(image).__name__))
+
+
+def _check_int(name, value, minimum=None):
+	"""Return ``value`` as a plain int, rejecting bools and non-integers."""
+	if isinstance(value, bool):
+		raise ImageHashSizeError('{} must be an integer, not bool'.format(name))
+	try:
+		number = operator.index(value)
+	except TypeError:
+		raise ImageHashSizeError('{} must be an integer, got {!r}'.format(name, value))
+	if minimum is not None and number < minimum:
+		raise ImageHashSizeError('{} must be >= {}, got {}'.format(name, minimum, number))
+	return number
+
+
+def _check_hash_size(hash_size, minimum=2):
+	hash_size = _check_int('hash_size', hash_size, minimum)
+	return hash_size
+
+
+def _frame_count(image):
+	"""Number of frames in ``image`` (1 for still images)."""
+	try:
+		count = getattr(image, 'n_frames', 1)
+	except Exception:
+		return 1
+	if count is None:
+		return 1
+	return int(count)
+
+
+def _independent_handle(image):
+	"""Return a second PIL handle for the same underlying data, if possible.
+
+	Pillow's APNG reader cannot serve ``seek()`` and ``copy()`` interleaved on
+	the same object without eventually raising "APNG contains frame sequence
+	errors", and its GIF reader closes a shared file object when a reopened
+	handle is closed.  Reading the encoded bytes into a private buffer gives a
+	handle that can be seeked freely without touching the caller's object.
+	"""
+	fp = getattr(image, 'fp', None)
+	if fp is None or not hasattr(fp, 'seek') or not hasattr(fp, 'tell'):
+		return None
+	try:
+		position = fp.tell()
+		fp.seek(0)
+		data = fp.read()
+		fp.seek(position)
+		if not data:
+			return None
+		clone = Image.open(io.BytesIO(data))
+		clone.load()
+		return clone
+	except Exception:
+		try:
+			fp.seek(position)
+		except Exception:
+			pass
+		return None
+
+
+def _copy_frame_in_place(image, frame):
+	"""Seek ``image`` to ``frame``, copy it, and restore the original frame."""
+	try:
+		current = image.tell()
+	except Exception:
+		current = 0
+	try:
+		image.seek(frame)
+		return image.copy()
+	finally:
+		try:
+			image.seek(current)
+		except Exception:
+			pass
+
+
+def select_frame(image, frame=0):
+	"""Return a detached *first* (or ``frame``-th) frame of ``image``.
+
+	Multi-frame GIF/APNG inputs are handled explicitly instead of leaving the
+	result to wherever the caller's iterator happens to point.  By default the
+	first frame is hashed.  The return value is a standalone image: seeking
+	never mutates the caller's object and the copied frame keeps its palette,
+	``info`` (including GIF ``transparency``) and EXIF metadata.
+
+	:param image: the image to read
+	:param frame: 0-based frame index; negative indices count from the end
+	"""
+	image = _check_image(image)
+	count = _frame_count(image)
+	if not isinstance(frame, int) or isinstance(frame, bool):
+		raise TypeError('frame must be an int')
+	if frame < 0:
+		frame += count
+	if frame < 0 or frame >= count:
+		raise ImageHashError(
+			'frame {} out of range for an image with {} frame(s)'.format(frame, count)
+		)
+	if count == 1:
+		return image.copy()
+	# ``seek`` mutates the shared image, so serialise frame access.
+	with _FRAME_LOCK:
+		clone = _independent_handle(image)
+		if clone is not None and _frame_count(clone) == count:
+			try:
+				clone.seek(frame)
+				return clone.copy()
+			finally:
+				clone.close()
+		return _copy_frame_in_place(image, frame)
+
+
+_PRE_MULTIPLIED_MODES = frozenset(('RGBa', 'La'))
+
+
+def _unpremultiply(image):
+	"""Convert a premultiplied-alpha image (``RGBa``/``La``) to straight RGBA.
+
+	Pillow cannot convert ``La`` at all and silently mis-unpremultiplies
+	``RGBa``, so the stored samples are expanded here:
+
+	``premultiplied = round(straight * alpha / 255)``  =>  ``straight = premultiplied * 255 / alpha``
+
+	with ``straight`` clamped to 255.
+	"""
+	raw = numpy.frombuffer(image.tobytes(), dtype=numpy.uint8)
+	raw = raw.reshape((image.size[1], image.size[0], len(image.getbands())))
+	alpha = raw[..., -1].astype(numpy.int32)
+	channels = raw[..., :-1].astype(numpy.int32)
+	with numpy.errstate(divide='ignore', invalid='ignore'):
+		straight = numpy.where(
+			alpha[..., None] == 0,
+			0,
+			numpy.minimum(255, (channels * 255 + alpha[..., None] // 2) // numpy.maximum(alpha[..., None], 1)),
+		)
+	if channels.shape[2] == 1:
+		straight = numpy.repeat(straight, 3, axis=2)
+	else:
+		straight = straight[:, :, :3]
+	rgba = numpy.dstack([straight, alpha[..., None]]).astype(numpy.uint8)
+	# A (h, w, 4) uint8 array infers RGBA without the deprecated mode kwarg.
+	return Image.fromarray(rgba)
+
+
+def _flatten_alpha(image, background):
+	"""Composite ``image`` over an opaque ``background`` and return RGB.
+
+	Transparent pixels in RGBA/LA/PA images still store RGB values that Pillow
+	drops when converting straight to ``L``/``RGB``.  Palette, ``L`` and
+	``RGB`` images may also declare colour-key transparency through the
+	``transparency`` entry of ``Image.info``.  Compositing makes the visible
+	pixel a deterministic function of the declared background rather than of
+	whatever was hidden behind alpha.
+	"""
+	has_alpha = image.mode in _ALPHA_MODES or 'transparency' in image.info
+	if not has_alpha:
+		return image.convert('RGB')
+	if image.mode in _PRE_MULTIPLIED_MODES:
+		foreground = _unpremultiply(image)
+	else:
+		foreground = image.convert('RGBA')
+	if background == (255, 255, 255):
+		# Identical to the general path, but skips a full-size composite for
+		# the default background.
+		canvas = Image.new('RGBA', foreground.size, (255, 255, 255, 255))
+	else:
+		canvas = Image.new('RGBA', foreground.size, background + (255,))
+	return Image.alpha_composite(canvas, foreground).convert('RGB')
+
+
+def _background_channel(value):
+	"""Validate a single 0..255 background channel."""
+	try:
+		channel = operator.index(value)
+	except TypeError:
+		raise ValueError('background channels must be integers in 0..255')
+	if not 0 <= channel <= 255:
+		raise ValueError('background channels must be integers in 0..255')
+	return channel
+
+
+def _check_background(background):
+	"""Validate a background colour and return an ``(r, g, b)`` tuple."""
+	if isinstance(background, str):
+		try:
+			return Image.new('RGB', (1, 1), background).getpixel((0, 0))
+		except (ValueError, TypeError):
+			raise ValueError('unknown background colour {!r}'.format(background))
+	try:
+		values = tuple(background)
+	except TypeError:
+		raise TypeError('background must be a colour name or an (r, g, b) tuple')
+	if len(values) != 3:
+		raise ValueError('background must have exactly 3 channels')
+	return tuple(_background_channel(value) for value in values)
+
+
+def to_visual_image(image, frame=0, background=DEFAULT_BACKGROUND):
+	"""Normalise an arbitrary PIL image to the agreed visual RGB input.
+
+	This is the preprocessing contract shared by every public hash function:
+
+	1. Multi-frame GIF/APNG images are pinned to one frame (first by default);
+		the caller's image is not seeked or modified.
+	2. EXIF orientation is applied (``ImageOps.exif_transpose``), so a rotated
+		JPEG hashes like the visual image it describes.
+	3. Images with an alpha channel are composited over ``background``
+		(white by default).  Palette, ``L`` and ``RGB`` images that declare
+		colour-key transparency in ``Image.info`` are treated the same way.
+	4. Every other mode (grayscale, palette, CMYK, ``I``, ...) is converted to
+		RGB directly.
+
+	:param image: PIL image
+	:param frame: 0-based frame index for multi-frame inputs
+	:param background: colour name or ``(r, g, b)`` tuple behind alpha
+	:raises TypeError: if ``image`` is not a PIL image
+	:raises ImageHashError: for empty images or invalid frame indices
+	"""
+	image = _check_image(image)
+	if image.size[0] == 0 or image.size[1] == 0:
+		raise ImageHashError(
+			'cannot hash an empty image with size {!r}'.format(tuple(image.size))
+		)
+	image = select_frame(image, frame)
+	image = ImageOps.exif_transpose(image)
+	return _flatten_alpha(image, _check_background(background))
+
+
+def to_gray_image(image, frame=0, background=DEFAULT_BACKGROUND):
+	"""``to_visual_image`` followed by Pillow's ``convert('L')``.
+
+	Keeping the RGB step explicit matters: converting RGBA straight to ``L``
+	ignores alpha and exposes hidden RGB values, whereas going through the
+	composited RGB yields the agreed visible luminance.
+	"""
+	return to_visual_image(image, frame=frame, background=background).convert('L')
+
 
 def _binary_array_to_hex(arr):
 	"""
@@ -107,19 +388,51 @@ class ImageHash:
 		# type: (ImageHash) -> int
 		if other is None:
 			raise TypeError('Other hash must not be None.')
+		if not isinstance(other, ImageHash):
+			raise TypeError('Other hash must be an ImageHash, not {!r}'.format(type(other).__name__))
 		if self.hash.size != other.hash.size:
 			raise TypeError('ImageHashes must be of the same shape.', self.hash.shape, other.hash.shape)
 		return numpy.count_nonzero(self.hash.flatten() != other.hash.flatten())
 
 	def __eq__(self, other):
 		# type: (object) -> bool
-		if other is None:
+		# Anything that is not an ImageHash (including None) is unequal
+		# rather than an error or a reflected array comparison.
+		if not isinstance(other, ImageHash):
 			return False
 		return numpy.array_equal(self.hash.flatten(), other.hash.flatten())  # type: ignore
 
 	def __ne__(self, other):
 		# type: (object) -> bool
 		return not self.__eq__(other)
+
+	def __lt__(self, other):
+		# type: (object) -> bool
+		# Plain ordering so that hashes parsed from strings still sort.
+		if not isinstance(other, ImageHash):
+			return NotImplemented
+		return self._sort_key() < other._sort_key()
+
+	def __le__(self, other):
+		# type: (object) -> bool
+		if not isinstance(other, ImageHash):
+			return NotImplemented
+		return self._sort_key() <= other._sort_key()
+
+	def __gt__(self, other):
+		# type: (object) -> bool
+		if not isinstance(other, ImageHash):
+			return NotImplemented
+		return self._sort_key() > other._sort_key()
+
+	def __ge__(self, other):
+		# type: (object) -> bool
+		if not isinstance(other, ImageHash):
+			return NotImplemented
+		return self._sort_key() >= other._sort_key()
+
+	def _sort_key(self):
+		return (self.hash.size, self.hash.shape, tuple(int(b) for b in self.hash.flatten()))
 
 	def __hash__(self):
 		# this returns a 8 bit integer, intentionally shortening the information
@@ -167,15 +480,33 @@ def hex_to_hash(hexstr):
 	Convert a stored hash (hex, as retrieved from str(Imagehash))
 	back to a Imagehash object.
 
+	The bit width is ``int(sqrt(len(hex) * 4)) ** 2``; this keeps the result
+	square for every size the library itself can emit, including odd
+	``hash_size`` values that need a final hex digit with spare bits.
+
 	Notes:
 	1. This algorithm assumes all hashes are either
 			bidimensional arrays with dimensions hash_size * hash_size,
 			or onedimensional arrays with dimensions binbits * 14.
 	2. This algorithm does not work for hash_size < 2.
+
+	:raises ValueError: if ``hexstr`` is not valid hexadecimal, or if its
+		value does not fit the square bit width implied by its length.
 	"""
+	try:
+		value = int(hexstr, 16)
+	except (TypeError, ValueError):
+		raise ValueError('invalid hexadecimal hash {!r}'.format(hexstr))
+	if value < 0:
+		raise ValueError('invalid hexadecimal hash {!r}'.format(hexstr))
 	hash_size = int(numpy.sqrt(len(hexstr) * 4))
-	# assert hash_size == numpy.sqrt(len(hexstr)*4)
-	binary_array = '{:0>{width}b}'.format(int(hexstr, 16), width=hash_size * hash_size)
+	width = hash_size * hash_size
+	if value.bit_length() > width:
+		raise ValueError(
+			'hexadecimal hash {!r} needs {} bits but implies a {}x{} hash'.format(
+				hexstr, value.bit_length(), hash_size, hash_size)
+		)
+	binary_array = '{:0>{width}b}'.format(value, width=width)
 	bit_rows = [binary_array[i:i + hash_size] for i in range(0, len(binary_array), hash_size)]
 	hash_array = numpy.array([[bool(int(d)) for d in row] for row in bit_rows])
 	return ImageHash(hash_array)
@@ -183,9 +514,38 @@ def hex_to_hash(hexstr):
 
 def hex_to_flathash(hexstr, hashsize):
 	# type: (str, int) -> ImageHash
-	hash_size = int(len(hexstr) * 4 / (hashsize))
-	binary_array = '{:0>{width}b}'.format(int(hexstr, 16), width=hash_size * hashsize)
-	hash_array = numpy.array([[bool(int(d)) for d in binary_array]])[-hash_size * hashsize:]
+	"""
+	Parse a hex string produced by ``str(ImageHash)`` for a flat hash.
+
+	``hashsize`` is the number of bins (14 for colorhash).  The returned array
+	has shape ``(hashsize, binbits)`` — the layout ``colorhash`` produces — so
+	a value serialised as ``str(colorhash(...))`` round-trips structurally and
+	not merely bit-for-bit.
+
+	:raises ValueError: for non-hexadecimal input, a non-positive ``hashsize``,
+		or a value too wide for its implied ``binbits``.
+	"""
+	if not isinstance(hashsize, int) or isinstance(hashsize, bool) or hashsize < 1:
+		raise ValueError('hashsize must be a positive integer')
+	try:
+		value = int(hexstr, 16)
+	except (TypeError, ValueError):
+		raise ValueError('invalid hexadecimal hash {!r}'.format(hexstr))
+	if value < 0:
+		raise ValueError('invalid hexadecimal hash {!r}'.format(hexstr))
+	hash_size = int(len(hexstr) * 4 / hashsize)
+	if hash_size < 1:
+		raise ValueError(
+			'hexadecimal hash {!r} is too short for {} bins'.format(hexstr, hashsize)
+		)
+	width = hash_size * hashsize
+	if value.bit_length() > width:
+		raise ValueError(
+			'hexadecimal hash {!r} needs {} bits but implies {} bins of {} bits'.format(
+				hexstr, value.bit_length(), hashsize, hash_size)
+		)
+	binary_array = '{:0>{width}b}'.format(value, width=width)
+	hash_array = numpy.array([bool(int(d)) for d in binary_array]).reshape((hashsize, hash_size))
 	return ImageHash(hash_array)
 
 
@@ -228,8 +588,8 @@ def old_hex_to_hash(hexstr, hash_size=8):
 	return ImageHash(numpy.array(arr))
 
 
-def average_hash(image, hash_size=8, mean=numpy.mean):
-	# type: (Image.Image, int, MeanFunc) -> ImageHash
+def average_hash(image, hash_size=8, mean=numpy.mean, frame=0, background=DEFAULT_BACKGROUND):
+	# type: (Image.Image, int, MeanFunc, int, tuple) -> ImageHash
 	"""
 	Average Hash computation
 
@@ -239,12 +599,21 @@ def average_hash(image, hash_size=8, mean=numpy.mean):
 
 	@image must be a PIL instance.
 	@mean how to determine the average luminescence. can try numpy.median instead.
-	"""
-	if hash_size < 2:
-		raise ValueError('Hash size must be greater than or equal to 2')
+	@frame which frame of a multi-frame GIF/APNG to hash (0 = first).
+	@background opaque colour behind transparent pixels, white by default.
 
-	# reduce size and complexity, then convert to grayscale
-	image = image.convert('L').resize((hash_size, hash_size), ANTIALIAS)
+	The image is normalised by ``to_gray_image`` (first frame, EXIF
+	orientation, alpha flattened onto white) before being resized to
+	``hash_size * hash_size`` with Lanczos and compared against ``mean``.
+	Pixels exactly equal to the mean are encoded as 0 (``>`` comparison).
+	"""
+	hash_size = _check_hash_size(hash_size)
+
+	# Acquire the agreed visual input before any resampling.
+	image = to_gray_image(image, frame=frame, background=background)
+
+	# reduce size and complexity
+	image = image.resize((hash_size, hash_size), ANTIALIAS)
 
 	# find average pixel value; 'pixels' is an array of the pixel values, ranging from 0 (black) to 255 (white)
 	pixels = numpy.asarray(image)
@@ -256,21 +625,27 @@ def average_hash(image, hash_size=8, mean=numpy.mean):
 	return ImageHash(diff)
 
 
-def phash(image, hash_size=8, highfreq_factor=4):
-	# type: (Image.Image, int, int) -> ImageHash
+def phash(image, hash_size=8, highfreq_factor=4, frame=0, background=DEFAULT_BACKGROUND):
+	# type: (Image.Image, int, int, int, tuple) -> ImageHash
 	"""
 	Perceptual Hash computation.
 
 	Implementation follows https://www.hackerfactor.com/blog/index.php?/archives/432-Looks-Like-It.html
 
 	@image must be a PIL instance.
+	@frame which frame of a multi-frame GIF/APNG to hash (0 = first).
+	@background opaque colour behind transparent pixels, white by default.
+
+	The luminance image is resized to ``hash_size * highfreq_factor``, a 2-D DCT
+	is taken with ``scipy.fftpack.dct`` along both axes, and the top-left
+	``hash_size * hash_size`` block is compared with its median (ties -> 0).
 	"""
-	if hash_size < 2:
-		raise ValueError('Hash size must be greater than or equal to 2')
+	hash_size = _check_hash_size(hash_size)
+	highfreq_factor = _check_int('highfreq_factor', highfreq_factor, 1)
 
 	import scipy.fftpack
 	img_size = hash_size * highfreq_factor
-	image = image.convert('L').resize((img_size, img_size), ANTIALIAS)
+	image = to_gray_image(image, frame=frame, background=background).resize((img_size, img_size), ANTIALIAS)
 	pixels = numpy.asarray(image)
 	dct = scipy.fftpack.dct(scipy.fftpack.dct(pixels, axis=0), axis=1)
 	dctlowfreq = dct[:hash_size, :hash_size]
@@ -279,8 +654,8 @@ def phash(image, hash_size=8, highfreq_factor=4):
 	return ImageHash(diff)
 
 
-def phash_simple(image, hash_size=8, highfreq_factor=4):
-	# type: (Image.Image, int, int) -> ImageHash
+def phash_simple(image, hash_size=8, highfreq_factor=4, frame=0, background=DEFAULT_BACKGROUND):
+	# type: (Image.Image, int, int, int, tuple) -> ImageHash
 	"""
 	Perceptual Hash computation.
 
@@ -288,9 +663,11 @@ def phash_simple(image, hash_size=8, highfreq_factor=4):
 
 	@image must be a PIL instance.
 	"""
+	hash_size = _check_hash_size(hash_size)
+	highfreq_factor = _check_int('highfreq_factor', highfreq_factor, 1)
 	import scipy.fftpack
 	img_size = hash_size * highfreq_factor
-	image = image.convert('L').resize((img_size, img_size), ANTIALIAS)
+	image = to_gray_image(image, frame=frame, background=background).resize((img_size, img_size), ANTIALIAS)
 	pixels = numpy.asarray(image)
 	dct = scipy.fftpack.dct(pixels)
 	dctlowfreq = dct[:hash_size, 1:hash_size + 1]
@@ -299,8 +676,8 @@ def phash_simple(image, hash_size=8, highfreq_factor=4):
 	return ImageHash(diff)
 
 
-def dhash(image, hash_size=8):
-	# type: (Image.Image, int) -> ImageHash
+def dhash(image, hash_size=8, frame=0, background=DEFAULT_BACKGROUND):
+	# type: (Image.Image, int, int, tuple) -> ImageHash
 	"""
 	Difference Hash computation.
 
@@ -309,20 +686,26 @@ def dhash(image, hash_size=8):
 	computes differences horizontally
 
 	@image must be a PIL instance.
+	@frame which frame of a multi-frame GIF/APNG to hash (0 = first).
+	@background opaque colour behind transparent pixels, white by default.
+
+	The luminance image is resized to ``(hash_size + 1) x hash_size`` and each
+	bit compares a pixel with the one to its left (``left < right`` -> 1, ties
+	-> 0).
 	"""
 	# resize(w, h), but numpy.array((h, w))
-	if hash_size < 2:
-		raise ValueError('Hash size must be greater than or equal to 2')
+	hash_size = _check_hash_size(hash_size)
 
-	image = image.convert('L').resize((hash_size + 1, hash_size), ANTIALIAS)
+	image = to_gray_image(image, frame=frame, background=background).resize(
+		(hash_size + 1, hash_size), ANTIALIAS)
 	pixels = numpy.asarray(image)
 	# compute differences between columns
 	diff = pixels[:, 1:] > pixels[:, :-1]
 	return ImageHash(diff)
 
 
-def dhash_vertical(image, hash_size=8):
-	# type: (Image.Image, int) -> ImageHash
+def dhash_vertical(image, hash_size=8, frame=0, background=DEFAULT_BACKGROUND):
+	# type: (Image.Image, int, int, tuple) -> ImageHash
 	"""
 	Difference Hash computation.
 
@@ -331,17 +714,28 @@ def dhash_vertical(image, hash_size=8):
 	computes differences vertically
 
 	@image must be a PIL instance.
+	@frame which frame of a multi-frame GIF/APNG to hash (0 = first).
+	@background opaque colour behind transparent pixels, white by default.
+
+	The luminance image is resized to ``hash_size x (hash_size + 1)`` and each
+	bit compares a pixel with the one above it (``above < below`` -> 1, ties
+	-> 0).
 	"""
 	# resize(w, h), but numpy.array((h, w))
-	image = image.convert('L').resize((hash_size, hash_size + 1), ANTIALIAS)
+	hash_size = _check_hash_size(hash_size)
+
+	image = to_gray_image(image, frame=frame, background=background).resize(
+		(hash_size, hash_size + 1), ANTIALIAS)
 	pixels = numpy.asarray(image)
 	# compute differences between rows
 	diff = pixels[1:, :] > pixels[:-1, :]
 	return ImageHash(diff)
 
 
-def whash(image, hash_size=8, image_scale=None, mode='haar', remove_max_haar_ll=True):
-	# type: (Image.Image, int, int | None, WhashMode, bool) -> ImageHash
+def whash(
+	image, hash_size=8, image_scale=None, mode='haar', remove_max_haar_ll=True, frame=0, background=DEFAULT_BACKGROUND
+):
+	# type: (Image.Image, int, int | None, WhashMode, bool, int, tuple) -> ImageHash
 	"""
 	Wavelet Hash computation.
 
@@ -355,22 +749,33 @@ def whash(image, hash_size=8, image_scale=None, mode='haar', remove_max_haar_ll=
 					'haar' - Haar wavelets, by default
 					'db4' - Daubechies wavelets
 	@remove_max_haar_ll - remove the lowest low level (LL) frequency using Haar wavelet.
+
+	The luminance image is resized to ``(image_scale, image_scale)``, scaled
+	to 0..1 and wavelet-decomposed.  The final LL block is compared with its
+	median (ties -> 0).
 	"""
 	import pywt
 	if image_scale is not None:
-		assert image_scale & (image_scale - 1) == 0, 'image_scale is not power of 2'
-	else:
+		image_scale = _check_int('image_scale', image_scale, 2)
+		if image_scale & (image_scale - 1) != 0:
+			raise ImageHashSizeError('image_scale is not power of 2')
+	hash_size = _check_hash_size(hash_size)
+	if hash_size & (hash_size - 1) != 0:
+		raise ImageHashSizeError('hash_size is not power of 2')
+
+	image = to_gray_image(image, frame=frame, background=background)
+	if image_scale is None:
 		image_natural_scale = 2**int(numpy.log2(min(image.size)))
 		image_scale = max(image_natural_scale, hash_size)
 
 	ll_max_level = int(numpy.log2(image_scale))
 
 	level = int(numpy.log2(hash_size))
-	assert hash_size & (hash_size - 1) == 0, 'hash_size is not power of 2'
-	assert level <= ll_max_level, 'hash_size in a wrong range'
+	if level > ll_max_level:
+		raise ImageHashSizeError('hash_size in a wrong range')
 	dwt_level = ll_max_level - level
 
-	image = image.convert('L').resize((image_scale, image_scale), ANTIALIAS)
+	image = image.resize((image_scale, image_scale), ANTIALIAS)
 	pixels = numpy.asarray(image) / 255.
 
 	# Remove low level frequency LL(max_ll) if @remove_max_haar_ll using haar filter
@@ -383,6 +788,9 @@ def whash(image, hash_size=8, image_scale=None, mode='haar', remove_max_haar_ll=
 	# Use LL(K) as freq, where K is log2(@hash_size)
 	coeffs = pywt.wavedec2(pixels, mode, level=dwt_level)
 	dwt_low = coeffs[0]
+	# Non-orthogonal filters such as 'db4' pad the approximation block, so
+	# trim it back to the agreed hash_size x hash_size grid.
+	dwt_low = dwt_low[:hash_size, :hash_size]
 
 	# Subtract median and compute hash
 	med = numpy.median(dwt_low)
@@ -390,8 +798,8 @@ def whash(image, hash_size=8, image_scale=None, mode='haar', remove_max_haar_ll=
 	return ImageHash(diff)
 
 
-def colorhash(image, binbits=3):
-	# type: (Image.Image, int) -> ImageHash
+def colorhash(image, binbits=3, frame=0, background=DEFAULT_BACKGROUND):
+	# type: (Image.Image, int, int, tuple) -> ImageHash
 	"""
 	Color Hash computation.
 
@@ -403,8 +811,15 @@ def colorhash(image, binbits=3):
 	* the next 6*binbits encode the fraction in 6 bins of saturation, for mildly saturated parts of the remaining image
 
 	@binbits number of bits to use to encode each pixel fractions
-	"""
 
+	The visual RGB image (alpha flattened onto white, EXIF orientation
+	applied, first frame) is converted to HSV with Pillow.  Saturation exactly
+	``256 * 2 // 3`` belongs to the bright group (``>=``).
+	"""
+	if not isinstance(binbits, int) or isinstance(binbits, bool) or binbits < 1:
+		raise ImageHashSizeError('binbits must be an integer >= 1')
+
+	image = to_visual_image(image, frame=frame, background=background)
 	# bin in hsv space:
 	intensity = numpy.asarray(image.convert('L')).flatten()
 	h, s, v = [numpy.asarray(v).flatten() for v in image.convert('HSV').split()]
@@ -456,8 +871,10 @@ class ImageMultiHash:
 
 	def __eq__(self, other):
 		# type: (object) -> bool
-		if other is None:
+		if not isinstance(other, ImageMultiHash):
 			return False
+		if not self.segment_hashes or not other.segment_hashes:
+			return not self.segment_hashes and not other.segment_hashes
 		return self.matches(other)  # type: ignore
 
 	def __ne__(self, other):
@@ -660,10 +1077,11 @@ def crop_resistant_hash(
 	:param min_segment_size: Minimum number of pixels for a hashable segment
 	:param segmentation_image_size: Size which the image is resized to before segmentation
 	"""
+	segmentation_image_size = _check_int('segmentation_image_size', segmentation_image_size, 1)
 
-	orig_image = image.copy()
+	orig_image = to_visual_image(image)
 	# Convert to gray scale and resize
-	image = image.convert('L').resize((segmentation_image_size, segmentation_image_size), ANTIALIAS)
+	image = orig_image.convert('L').resize((segmentation_image_size, segmentation_image_size), ANTIALIAS)
 	# Add filters
 	image = image.filter(ImageFilter.GaussianBlur()).filter(ImageFilter.MedianFilter())
 	pixels = numpy.array(image).astype(numpy.float32)

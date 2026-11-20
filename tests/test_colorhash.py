@@ -68,7 +68,9 @@ class Test(TestImageHash):
 			arr[..., 0] = 30
 			arr[..., 1] = saturation
 			arr[..., 2] = 255
-			image = Image.fromarray(arr, 'HSV').convert('RGB')
+			# ``Image.merge`` avoids Pillow's deprecated ``fromarray(..., mode=)``.
+			channels = [Image.fromarray(arr[..., index]) for index in range(3)]
+			image = Image.merge('HSV', channels).convert('RGB')
 			round_tripped = numpy.asarray(image.convert('HSV'))[..., 1]
 			emsg = 'RGB round trip changed the saturation under test'
 			self.assertEqual(sorted(set(round_tripped.flatten().tolist())), [saturation], emsg)

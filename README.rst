@@ -57,6 +57,48 @@ colorhash, its :code:`binbits`). Increasing the hash size allows an
 algorithm to store more detail in its hash, increasing its sensitivity
 to changes in detail.
 
+Input preprocessing contract
+============================
+
+All public hash functions normalise their input the same way before
+resizing or converting it (see :func:`imagehash.to_visual_image`):
+
+* **Multi-frame images** (GIF/APNG) are read from a single frame.  The
+  first frame is used by default; pass :code:`frame=` to pick another one.
+  The caller's image is never seeked or otherwise modified.
+* **EXIF orientation** is applied, so a rotated JPEG hashes like the image
+  it visually represents.
+* **Transparency** is flattened onto an opaque background (white by
+  default; pass :code:`background=` to change it).  RGB values hidden
+  behind alpha are never used.  Palette, ``L`` and ``RGB`` images that
+  declare colour-key transparency in ``Image.info`` are treated the same
+  way.
+* Grayscale, palette, CMYK and other modes are converted to RGB, so the
+  same picture stored in different modes hashes identically.
+
+Empty images raise :class:`imagehash.ImageHashError`; invalid
+``hash_size``/``binbits`` values raise
+:class:`imagehash.ImageHashSizeError` (a :class:`ValueError`).  ``hash_size``
+for :func:`imagehash.whash` must be a power of two; the resulting hash always
+has exactly ``hash_size ** 2`` bits, including for the ``db4`` mode.
+
+Reproducing the contract checks
+================================
+
+The contract above is pinned by offline, self-generated fixtures (no network
+and no checked-in binaries); see ``tests/fixtures.py``.  Run::
+
+	pytest
+
+To print the Pillow/NumPy/SciPy/PyWavelets versions and the file-format
+coverage of the fixtures — including any format that is missing a sample —::
+
+	python3 tests/report_format_coverage.py
+
+The script exits non-zero if a required format has no working sample, so a
+missing fixture can never pass silently.
+
+
 The demo script **find_similar_images** illustrates how to find similar
 images in a directory.
 
