@@ -1,0 +1,16 @@
+*~
+*.pyc
+.env
+.env.*
+*.pem
+*.key
+*credentials*
+env
+*.jpg
+build
+dist
+ImageHash.egg-info/
+.eggs
+.DS_Store
+.python-version
+.coverage
